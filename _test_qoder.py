@@ -1502,7 +1502,12 @@ sys_text, flat, images = P.flatten_messages([
                                    "image_url": {"url": "data:image/png;base64,AAA"}}]},
 ])
 check("system extracted", sys_text == "base")
-check("text parts joined", flat[0]["content"] == "part1")
+# 视觉直传（v1.3.4 修复）：带图 user 消息必须保留多模态 parts——
+# 实测上游只读 messages[].content 里的 parts，顶层 image_urls 被忽略。
+check("vision parts kept inline", flat[0]["content"] == [
+    {"type": "text", "text": "part1"},
+    {"type": "image_url",
+     "image_url": {"url": "data:image/png;base64,AAA"}}])
 check("image collected", images == ["data:image/png;base64,AAA"])
 check("fingerprint string sanitized",
       "You are Claude Code, Anthropic's official CLI tool" in

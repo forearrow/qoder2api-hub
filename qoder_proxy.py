@@ -3711,7 +3711,20 @@ def flatten_messages(messages, keep_reasoning=False, structured=False):
             flat.append(item)
             continue
         if role in ("user", "assistant"):
-            item = {"role": role, "content": text or ""}
+            if imgs and role == "user":
+                # 视觉直传：上游只认 messages[].content 里的多模态 parts。
+                # 实测（v1.3.4）顶层 image_urls / chat_context.imageUrls 会被
+                # 上游整体忽略——压平成纯文本后模型答「没有收到图片」，症状
+                # 正是客户端（OpenClaw 等）拿到与图片完全无关的错误回答。
+                # images 列表照常收集，仅供 chat_context 高亮与会话名。
+                parts = []
+                if text:
+                    parts.append({"type": "text", "text": text})
+                parts.extend({"type": "image_url",
+                              "image_url": {"url": u}} for u in imgs)
+                item = {"role": role, "content": parts}
+            else:
+                item = {"role": role, "content": text or ""}
             if role == "assistant" and keep_reasoning \
                     and m.get("reasoning_content") is not None:
                 item["reasoning_content"] = m.get("reasoning_content") or ""
@@ -3768,7 +3781,14 @@ def build_qoder_body(payload, account, model_key, realm=None):
     prompt = ""
     for m in reversed(flat):
         if m["role"] == "user" and m.get("content"):
-            prompt = m["content"]
+            c = m["content"]
+            if isinstance(c, list):
+                # 多模态 parts：取文本部分做会话名/高亮
+                prompt = "\n".join(
+                    str(p.get("text") or "") for p in c
+                    if isinstance(p, dict) and p.get("type") == "text")
+            else:
+                prompt = c
             break
 
     nid = str(uuid.uuid4())
@@ -3817,9 +3837,21 @@ def build_qoder_body(payload, account, model_key, realm=None):
     extra["modelConfig"] = dict(mc)
     cc["extra"] = extra
     if images:
-        cc["imageUrls"] = images
-        body["image_urls"] = images
+        # data: URL 已内联在消息 parts 里；顶层字段只保留 http(s) 链接，
+        # 避免同一张图在请求体里双份携带（上游不读该字段，仅展示用途）。
+        http_imgs = [u for u in images if not str(u).startswith("data:")]
+        if http_imgs:
+            cc["imageUrls"] = http_imgs
+            body["image_urls"] = http_imgs
     body["chat_context"] = cc
+    if not mc["is_vl"]:
+        # 非视觉模型：多模态 parts 降级回纯文本（与旧行为一致——图片本就
+        # 到不了模型），避免上游对不支持的 parts 形态报错。
+        for m in body["messages"]:
+            if isinstance(m.get("content"), list):
+                m["content"] = "\n".join(
+                    str(p.get("text") or "") for p in m["content"]
+                    if isinstance(p, dict) and p.get("type") == "text")
 
     # parameters：max_tokens / reasoning_effort
     params = body.get("parameters") or {}
