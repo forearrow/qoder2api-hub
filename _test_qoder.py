@@ -1512,12 +1512,16 @@ check("image collected", images == ["data:image/png;base64,AAA"])
 # 单 part dict 形态（issue #33 根因）：content 直接给一个 part 对象而非列表时，
 # 图像必须被收集、绝不 str() 成 Python 字面量文本——旧行为是模型收到
 # "{'type': 'image_url', ...}" 字符串且图像丢失。
+# 合并语义（v1.4.1 × 视觉直传）：dict 形态经 _flatten_content_text 归一为
+# 单元素列表后，与 list 形态一样走视觉直传——content 保留结构化 parts，而非纯文本。
 _sys_d, _flat_d, _img_d = P.flatten_messages([
     {"role": "user", "content": {"type": "image_url",
                                   "image_url": {"url": "data:image/png;base64,BBB"}}}])
 check("dict 单 part：图像收集而非字符串化",
       _img_d == ["data:image/png;base64,BBB"]
-      and "image_url" not in str(_flat_d[0].get("content") or ""))
+      and _flat_d[0]["content"] == [
+          {"type": "image_url",
+           "image_url": {"url": "data:image/png;base64,BBB"}}])
 _resp_d = P._flatten_content({"type": "input_image",
                               "image_url": "data:image/png;base64,CCC"})
 check("Responses dict 单 part：保留结构化 image_url part 而非 str()",
