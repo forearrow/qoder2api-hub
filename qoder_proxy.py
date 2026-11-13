@@ -36,6 +36,7 @@ import os
 MAX_PAYLOAD_BYTES = int(os.environ.get("QD_MAX_PAYLOAD_BYTES", 50 * 1024 * 1024))  # 50MB limit
 import ipaddress
 import socket
+import signal
 import ssl
 import sys
 import threading
@@ -71,7 +72,7 @@ from qoder_accounts import (get_realm_config, gateway_candidates,
                             local_vm_status)
 from pathlib import Path
 
-VERSION = "1.9.8"
+VERSION = "1.9.9"
 
 CURRENT_REALM = os.environ.get("QD_PROXY_DEFAULT_REALM", "cn")
 
@@ -367,6 +368,40 @@ class _ExclusiveHTTPServer(ThreadingHTTPServer):
             self.socket.setsockopt(socket.SOL_SOCKET,
                                    socket.SO_EXCLUSIVEADDRUSE, 1)
             super().server_bind()
+
+
+def serve_http_server(server):
+    """Handle PID 1 SIGTERM without calling shutdown on the serving thread.
+
+    SystemExit unwinds serve_forever into server_close and normal atexit cleanup.
+    HTTPServer.shutdown() must not be used in this handler: it waits for the same
+    thread's serve_forever loop and deadlocks. Repeated TERM during close is ignored.
+    """
+    previous = None
+    installed = False
+    stopping = False
+
+    def terminate(signum, frame):
+        nonlocal stopping
+        if not stopping:
+            stopping = True
+            raise SystemExit(0)
+
+    try:
+        if threading.current_thread() is threading.main_thread():
+            previous = signal.signal(signal.SIGTERM, terminate)
+            installed = True
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            log("bye")
+    finally:
+        stopping = True
+        try:
+            server.server_close()
+        finally:
+            if installed:
+                signal.signal(signal.SIGTERM, previous)
 
 
 CHAT_PATH = ("/algo/api/v2/service/pro/sse/agent_chat_generation"
@@ -14927,15 +14962,7 @@ def main():
     # 进程生命周期内保持 handler 引用：SetConsoleCtrlHandler 存的是裸指针，
     # 回调被 GC 会在关窗时崩溃。
     _ctrl_handler = install_console_close_handler()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        log("bye")
-    finally:
-        try:
-            server.server_close()
-        except Exception:
-            pass
+    serve_http_server(server)
 
 
 if __name__ == "__main__":
