@@ -5544,6 +5544,62 @@ def _frame_without_content(payload):
     return out
 
 
+def _sse_normalize_tool_call_indices(frames):
+    states = {}
+    for raw in frames:
+        text = raw.decode("utf-8", "replace") if isinstance(raw, bytes) else raw
+        data = strip_data_prefix(text)
+        try:
+            payload = json.loads(data) if data and data != "[DONE]" else None
+        except (TypeError, ValueError):
+            payload = None
+        if not isinstance(payload, dict) or not isinstance(payload.get("choices"), list):
+            yield raw
+            continue
+        changed = False
+        for choice_position, choice in enumerate(payload["choices"]):
+            if not isinstance(choice, dict):
+                continue
+            delta = choice.get("delta")
+            calls = delta.get("tool_calls") if isinstance(delta, dict) else None
+            if not isinstance(calls, list):
+                continue
+            choice_index = choice.get("index")
+            if not isinstance(choice_index, int) or isinstance(choice_index, bool):
+                choice_index = choice_position
+            state = states.setdefault(choice_index, {"ids": {}, "active": {}, "slots": {}})
+            for call_position, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    continue
+                wire_index = call.get("index")
+                if not isinstance(wire_index, int) or isinstance(wire_index, bool) or wire_index < 0:
+                    wire_index = call_position
+                call_id = call.get("id")
+                call_id = call_id if isinstance(call_id, str) and call_id.strip() else ""
+                slot = state["ids"].get(call_id) if call_id else None
+                if slot is None:
+                    slot = state["active"].get(wire_index)
+                    if slot is not None and call_id and slot["id"] and slot["id"] != call_id:
+                        slot = None
+                if slot is None:
+                    normalized_index = wire_index
+                    if normalized_index in state["slots"]:
+                        normalized_index = max(state["slots"], default=-1) + 1
+                    slot = {"index": normalized_index, "id": call_id}
+                    state["slots"][normalized_index] = slot
+                if call_id:
+                    slot["id"] = call_id
+                    state["ids"][call_id] = slot
+                state["active"][wire_index] = slot
+                if call.get("index") != slot["index"] or isinstance(call.get("index"), bool):
+                    call["index"] = slot["index"]
+                    changed = True
+        if changed:
+            yield ("data: " + json.dumps(payload, ensure_ascii=False) + "\n\n").encode("utf-8")
+        else:
+            yield raw
+
+
 def _sse_fill_tool_call_ids(frames):
     """流式出口保证：tool_call 增量的 id 必须非空（issue #47）。
 
@@ -6544,6 +6600,7 @@ def recover_leaked_tool_calls(frames, allowed_names=None, audit=None):
     各阶段都是生成器，顺序即数据流方向；用具名中间变量而非层层嵌套 ——
     出口是包装器这一事实要能被静态断言钉住（见 _test_stream_tool_ids 第 7 节）。
     """
+    frames = _sse_normalize_tool_call_indices(frames)
     leaked = _recover_leaked_tool_calls_inner(frames, allowed_names)
     dsml = _sse_recover_dsml(leaked, allowed_names)
     tagged = _sse_recover_tool_tags(dsml, allowed_names)
@@ -9518,7 +9575,7 @@ def aggregate_stream(resp, model, resp_id=None, holder=None, allowed_names=None)
     first_chunk_at = None
     created = None
 
-    for line in iter_inner_sse(resp, holder=holder):
+    for line in _sse_normalize_tool_call_indices(iter_inner_sse(resp, holder=holder)):
         data = strip_data_prefix(line.decode("utf-8", "replace"))
         if not data or data == "[DONE]":
             continue
